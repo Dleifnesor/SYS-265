@@ -38,7 +38,7 @@ A production-ready, multi-container Plex media server stack.
 ### 1. Clone the repo
 
 ```bash
-git clone <your-repo-url> /opt/plex-docker
+git clone https://github.com/Dleifnesor/SYS-265 /opt/plex-docker
 cd /opt/plex-docker
 ```
 
