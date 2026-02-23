@@ -1,0 +1,122 @@
+version: "3.9"
+
+services:
+
+  # ── Plex Media Server ─────────────────────────────────────────────────────
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    network_mode: host          # Required for local network discovery / GDM
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM}
+    volumes:
+      - ${CONFIG_DIR}/plex:/config
+      - ${MEDIA_DIR}/tv:/tv
+      - ${MEDIA_DIR}/movies:/movies
+      - ${MEDIA_DIR}/music:/music
+      - /tmp/plex-transcode:/transcode
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    labels:
+      - "com.plex.description=Plex Media Server"
+
+  # ── PostgreSQL – Plex metadata / watch-state DB ──────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: plex-db
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost-only; not exposed externally
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.plex.description=Plex PostgreSQL Database"
+
+  # ── Overseerr – Request management web UI ────────────────────────────────
+  overseerr:
+    image: lscr.io/linuxserver/overseerr:latest
+    container_name: overseerr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_DIR}/overseerr:/config
+    ports:
+      - "5055:5055"
+    restart: unless-stopped
+    labels:
+      - "com.plex.description=Overseerr Request Manager"
+
+  # ── Tautulli – Plex analytics & monitoring ───────────────────────────────
+  tautulli:
+    image: lscr.io/linuxserver/tautulli:latest
+    container_name: tautulli
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_DIR}/tautulli:/config
+    ports:
+      - "8181:8181"
+    restart: unless-stopped
+    depends_on:
+      - plex
+    labels:
+      - "com.plex.description=Plex Analytics"
+
+  # ── Nginx – Reverse proxy / web front-end ────────────────────────────────
+  nginx:
+    image: nginx:stable-alpine
+    container_name: plex-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    restart: unless-stopped
+    depends_on:
+      - overseerr
+      - tautulli
+    labels:
+      - "com.plex.description=Nginx Reverse Proxy"
+
+  # ── Watchtower – Automatic container image updates ───────────────────────
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCHEDULE=${WATCHTOWER_SCHEDULE}
+      - TZ=${TZ}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    labels:
+      - "com.plex.description=Auto-updater"
+
+volumes:
+  db_data:
+    driver: local
+  nginx_logs:
+    driver: local
