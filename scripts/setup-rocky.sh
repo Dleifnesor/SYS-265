@@ -95,7 +95,12 @@ info "Directories created under /opt/plex"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-if [[ ! -f "$PROJECT_DIR/.env" ]]; then
+if [[ ! -f "$PROJECT_DIR/.env.example" ]]; then
+    warn ".env.example not found at $PROJECT_DIR"
+    warn "Make sure the full project repo is cloned to that directory, then run:"
+    warn "  cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env  && nano $PROJECT_DIR/.env"
+    warn "Skipping .env creation – you must create it manually before running docker compose up."
+elif [[ ! -f "$PROJECT_DIR/.env" ]]; then
     cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
     warn ".env created from .env.example – EDIT IT before running docker compose up!"
 else
