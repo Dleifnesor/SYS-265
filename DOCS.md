@@ -173,7 +173,7 @@ Plex will not start until this healthcheck passes, preventing startup race condi
 | Config volume | `${CONFIG_DIR}/overseerr:/config` |
 | Restart policy | `unless-stopped` |
 
-Overseerr is a media request manager that integrates with Plex, Sonarr, and Radarr. It is accessible directly on port 5055 **and** via Nginx at `https://overseerr.<your-domain>`.
+Overseerr is a media request manager that integrates with Plex, Sonarr, and Radarr. It is accessible directly on port 5055 **and** via Nginx at `https://overseerr.web01.DanielR.local`.
 
 ---
 
@@ -188,7 +188,7 @@ Overseerr is a media request manager that integrates with Plex, Sonarr, and Rada
 | Restart policy | `unless-stopped` |
 | Dependency | Requires `plex` to be running |
 
-Tautulli provides Plex playback statistics, user activity, and notification integrations. Accessible on port 8181 or via Nginx at `https://tautulli.<your-domain>`.
+Tautulli provides Plex playback statistics, user activity, and notification integrations. Accessible on port 8181 or via Nginx at `https://tautulli.web01.DanielR.local`.
 
 ---
 
@@ -252,7 +252,7 @@ cp .env.example .env
 | `DB_PASSWORD` | `changeme_strong_password` | PostgreSQL password – **must be changed** |
 | `DB_NAME` | `plexdb` | PostgreSQL database name |
 | `WATCHTOWER_SCHEDULE` | `0 0 3 * * *` | Cron expression for Watchtower (default: 3 AM daily) |
-| `SERVER_NAME` | `plex.example.com` | Used in Nginx virtual host configs |
+| `SERVER_NAME` | `web01.DanielR.local` | Hostname used in Nginx virtual host configs |
 
 > **Security:** `.env` is listed in `.gitignore`. Never commit it.
 
@@ -354,7 +354,7 @@ Catches all HTTP traffic and permanently redirects it to HTTPS.
 
 #### 2. Overseerr Virtual Host (port 443)
 
-- `server_name`: `overseerr.plex.example.com` – **update to your domain**
+- `server_name`: `overseerr.web01.DanielR.local`
 - TLS: `TLSv1.2` and `TLSv1.3` only; weak ciphers excluded
 - Rate limit: `burst=40 nodelay` from the `general` zone
 - Proxy: forwards to `http://overseerr:5055`
@@ -362,16 +362,11 @@ Catches all HTTP traffic and permanently redirects it to HTTPS.
 
 #### 3. Tautulli Virtual Host (port 443)
 
-- `server_name`: `tautulli.plex.example.com` – **update to your domain**
+- `server_name`: `tautulli.web01.DanielR.local`
 - Same TLS and rate limiting as Overseerr
 - Proxy: forwards to `http://tautulli:8181`
 
-**To update domain names:**
-
-```bash
-# Replace placeholder domains with your actual domain
-sed -i 's/plex.example.com/your-actual-domain.com/g' nginx/conf.d/plex.conf
-```
+> **Local DNS required:** `.local` subdomains are not resolved by mDNS. Add `A` records for `overseerr.web01.DanielR.local` and `tautulli.web01.DanielR.local` pointing to the server's IP in your local DNS (Pi-hole, pfSense, Windows DNS Server, etc.).
 
 ---
 
@@ -386,22 +381,13 @@ nginx/ssl/privkey.pem     # Private key (chmod 600)
 
 These paths are gitignored. Two options:
 
-**Option A – Self-signed (dev/local):**
+**Option A – Self-signed (local – web01.DanielR.local):**
 
 ```bash
-bash scripts/generate-selfsigned-ssl.sh plex.local
+bash scripts/generate-selfsigned-ssl.sh web01.DanielR.local
 ```
 
-Generates a cert valid for the domain and its `overseerr.*` / `tautulli.*` subdomains.
-
-**Option B – Let's Encrypt (production):**
-
-```bash
-sudo certbot certonly --standalone -d plex.example.com \
-    -d overseerr.plex.example.com -d tautulli.plex.example.com
-sudo cp /etc/letsencrypt/live/plex.example.com/fullchain.pem nginx/ssl/
-sudo cp /etc/letsencrypt/live/plex.example.com/privkey.pem  nginx/ssl/
-```
+Generates a cert covering `web01.DanielR.local`, `overseerr.web01.DanielR.local`, and `tautulli.web01.DanielR.local`.
 
 ---
 
@@ -473,6 +459,8 @@ git clone <your-repo-url> /opt/plex-docker
 cd /opt/plex-docker
 ```
 
+> **Host:** `web01.DanielR.local`
+
 ### 2. Bootstrap the host (Rocky Linux)
 
 ```bash
@@ -489,41 +477,39 @@ nano .env
 
 At minimum, set: `PLEX_CLAIM`, `DB_PASSWORD`, `TZ`, `PUID`/`PGID`, `MEDIA_DIR`, `CONFIG_DIR`.
 
-### 4. Generate or install TLS certificates
+### 4. Generate TLS certificates
 
-**Local/dev:**
 ```bash
-bash scripts/generate-selfsigned-ssl.sh plex.local
+bash scripts/generate-selfsigned-ssl.sh web01.DanielR.local
 ```
 
-**Production:**
-```bash
-sudo certbot certonly --standalone -d plex.example.com
-sudo cp /etc/letsencrypt/live/plex.example.com/fullchain.pem nginx/ssl/
-sudo cp /etc/letsencrypt/live/plex.example.com/privkey.pem  nginx/ssl/
-```
+Covers `web01.DanielR.local`, `overseerr.web01.DanielR.local`, and `tautulli.web01.DanielR.local`.
 
-### 5. Update Nginx domain names
-
-Edit `nginx/conf.d/plex.conf` and replace `plex.example.com` with your actual domain.
-
-### 6. Start the stack
+### 5. Start the stack
 
 ```bash
 docker compose up -d
 ```
 
-### 7. Complete Plex setup
+### 6. Complete Plex setup
 
-Open `http://<server-ip>:32400/web` in your browser and follow the Plex setup wizard.
+Open `http://web01.DanielR.local:32400/web` in your browser and follow the Plex setup wizard.
 
-### 8. Connect Tautulli to Plex
+### 7. Connect Tautulli to Plex
 
-Open `http://<server-ip>:8181` and configure Tautulli to point to your Plex server.
+Open `http://web01.DanielR.local:8181` and configure Tautulli to point to your Plex server.
 
-### 9. Connect Overseerr to Plex
+### 8. Connect Overseerr to Plex
 
-Open `http://<server-ip>:5055` and follow the Overseerr setup, linking it to your Plex server and optionally to Sonarr/Radarr.
+Open `http://web01.DanielR.local:5055` and follow the Overseerr setup, linking it to your Plex server and optionally to Sonarr/Radarr.
+
+### Service URLs
+
+| Service | Direct URL | Via Nginx (requires local DNS) |
+|---------|-----------|-------------------------------|
+| Plex | `http://web01.DanielR.local:32400/web` | — (host network, no proxy) |
+| Overseerr | `http://web01.DanielR.local:5055` | `https://overseerr.web01.DanielR.local` |
+| Tautulli | `http://web01.DanielR.local:8181` | `https://tautulli.web01.DanielR.local` |
 
 ---
 
@@ -686,7 +672,7 @@ docker compose logs nginx
 Regenerate self-signed certs if missing:
 
 ```bash
-bash scripts/generate-selfsigned-ssl.sh plex.local
+bash scripts/generate-selfsigned-ssl.sh web01.DanielR.local
 docker compose restart nginx
 ```
 

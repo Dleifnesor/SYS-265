@@ -42,6 +42,8 @@ git clone <your-repo-url> /opt/plex-docker
 cd /opt/plex-docker
 ```
 
+> **Host:** `web01.DanielR.local`
+
 ### 2. Run the bootstrap script
 
 ```bash
@@ -70,31 +72,30 @@ Key values to set:
 
 ### 4. Add TLS certificates
 
-**Self-signed (dev/local):**
+**Self-signed (local – web01.DanielR.local):**
 ```bash
-bash scripts/generate-selfsigned-ssl.sh plex.local
+bash scripts/generate-selfsigned-ssl.sh web01.DanielR.local
 ```
 
-**Let's Encrypt (production):**
-```bash
-sudo certbot certonly --standalone -d plex.example.com
-sudo cp /etc/letsencrypt/live/plex.example.com/fullchain.pem nginx/ssl/
-sudo cp /etc/letsencrypt/live/plex.example.com/privkey.pem  nginx/ssl/
-```
+This generates a cert covering `web01.DanielR.local`, `overseerr.web01.DanielR.local`, and `tautulli.web01.DanielR.local`.
 
-### 5. Update Nginx config
+> **Note:** `.local` subdomains require a local DNS server (e.g. Pi-hole, pfSense, Windows DNS) to resolve. mDNS alone only resolves the base hostname `web01.DanielR.local`.
 
-Edit `nginx/conf.d/plex.conf` and replace `plex.example.com` with your domain.
-
-### 6. Start the stack
+### 5. Start the stack
 
 ```bash
 docker compose up -d
 ```
 
-### 7. Initial Plex setup
+### 6. Initial Plex setup
 
-Open `http://<server-ip>:32400/web` and complete the setup wizard.
+Open `http://web01.DanielR.local:32400/web` and complete the setup wizard.
+
+| Service | URL |
+|---------|-----|
+| Plex | `http://web01.DanielR.local:32400/web` |
+| Overseerr | `https://overseerr.web01.DanielR.local` |
+| Tautulli | `https://tautulli.web01.DanielR.local` |
 
 ---
 
