@@ -18,6 +18,14 @@ dnf update -y
 
 # ── 2. Install Docker (official repo) ────────────────────────────────────────
 info "Installing Docker CE..."
+
+# Rocky Linux ships podman-docker (a Podman shim) which conflicts with docker-ce.
+# Remove it first if present so the real Docker CE can install cleanly.
+if rpm -q podman-docker &>/dev/null; then
+    warn "Removing podman-docker (conflicts with docker-ce)..."
+    dnf remove -y podman-docker
+fi
+
 dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 

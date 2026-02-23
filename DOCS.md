@@ -624,6 +624,21 @@ The `setup-rocky.sh` script sets the `container_manage_cgroup` boolean and remin
 
 ## Troubleshooting
 
+### `dnf install docker-ce` fails with a conflict against `podman-docker`
+
+Rocky Linux ships `podman-docker` — a shim that provides the `docker` command via Podman.
+It conflicts with the real `docker-ce` package. Remove it first:
+
+```bash
+sudo dnf remove -y podman-docker
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+```
+
+`setup-rocky.sh` now handles this automatically, but if you ran an older version of the script you will need to do this manually.
+
+---
+
 ### Plex won't start
 
 ```bash
