@@ -1,39 +1,3 @@
-# Plex Docker Stack – Rocky Linux
-
-A production-ready, multi-container Plex media server stack.
-
-## Containers
-
-| Container | Image | Port | Purpose |
-|-----------|-------|------|---------|
-| `plex` | linuxserver/plex | 32400 (host) | Plex Media Server |
-| `db` | postgres:16-alpine | 5432 (localhost only) | PostgreSQL metadata DB |
-| `overseerr` | linuxserver/overseerr | 5055 | Media request manager |
-| `tautulli` | linuxserver/tautulli | 8181 | Plex analytics |
-| `nginx` | nginx:stable-alpine | 80, 443 | Reverse proxy |
-| `watchtower` | containrrr/watchtower | — | Auto image updates |
-
-## Directory Layout
-
-```
-.
-├── docker-compose.yml
-├── .env.example          # Copy to .env and fill in values
-├── .gitignore
-├── db/
-│   └── init/
-│       └── 01_init.sql   # Runs on first DB start
-├── nginx/
-│   ├── nginx.conf
-│   ├── conf.d/
-│   │   └── plex.conf     # Virtual host definitions
-│   └── ssl/              # Place TLS certs here
-└── scripts/
-    ├── setup-rocky.sh            # One-shot host bootstrap
-    └── generate-selfsigned-ssl.sh
-```
-
-## Quick Start (on Rocky Linux)
 
 ### 1. Clone the repo
 
