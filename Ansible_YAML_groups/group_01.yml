@@ -1,0 +1,344 @@
+---
+# ================================================================
+# Group 01 | Ansible Self-Learning Lab
+# ================================================================
+# Sections:
+#   SysAdmin-1  : Disk space inventory across all hosts
+#   SysAdmin-2  : Write a managed-host identity file to every node
+#   Hardening-1 : Disable the built-in Guest account (Windows)
+#   Hardening-2 : Ensure firewalld is active and enabled (Rocky)
+#   GPO-1       : Create GPO Lab-G01-Hardening and link to domain
+#   GPO-2       : Disable Autorun on all drive types (Computer Config)
+#   GPO-3       : Screensaver timeout + password-on-resume (User Config)
+#
+# Environment:
+#   Domain  : DANIELR.local  |  DN: DC=danielr,DC=local
+#   Groups  : [windows] -> AD01, MGMT01, WKS01
+#             [rocky]   -> Ansible01, Ansible02
+#
+# Usage:
+#   Dry-run : ansible-playbook group_01.yml --check
+#   Apply   : ansible-playbook group_01.yml
+# ================================================================
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Disk Space Inventory
+# Both OS families are handled in one play using 'when' conditionals
+# on ansible_os_family. changed_when: false prevents false change
+# reporting on read-only shell commands.
+# ----------------------------------------------------------------
+- name: "G01 | SysAdmin-1 | Disk space inventory - Windows hosts"
+  hosts: windows
+  gather_facts: true   # ansible_os_family requires gathered facts
+
+  tasks:
+
+    # Get-PSDrive scoped to the FileSystem provider returns all
+    # mounted drives. Output is formatted inline via calculated
+    # properties (@{N=...;E=...}) to show GB values.
+    - name: "Windows | Retrieve FileSystem drive usage via PowerShell"
+      ansible.windows.win_shell: |
+        Get-PSDrive -PSProvider FileSystem |
+          Select-Object Name,
+            @{N='Used_GB';E={[math]::Round($_.Used/1GB,2)}},
+            @{N='Free_GB';E={[math]::Round($_.Free/1GB,2)}} |
+          Format-Table -AutoSize
+      register: win_disk
+      changed_when: false   # read-only; never marks host as changed
+
+    - name: "Windows | Display disk usage"
+      ansible.builtin.debug:
+        var: win_disk.stdout_lines
+
+
+- name: "G01 | SysAdmin-1 | Disk space inventory - Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    # df --output limits columns to the fields we care about.
+    # command is preferred over shell when no shell features are needed.
+    - name: "Rocky | Run df to show mounted filesystem usage"
+      ansible.builtin.command: df -h --output=source,size,used,avail,pcent,target
+      register: rocky_disk
+      changed_when: false
+
+    - name: "Rocky | Display disk usage"
+      ansible.builtin.debug:
+        var: rocky_disk.stdout_lines
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-2 | Host Identity File
+# Writes a plain-text stamp file to each host confirming Ansible
+# has write access. block/rescue catches write failures and emits
+# a readable message instead of a raw module traceback.
+# ansible_date_time is populated by gather_facts.
+# ----------------------------------------------------------------
+- name: "G01 | SysAdmin-2 | Write host identity file to all hosts"
+  hosts: all
+  gather_facts: true
+
+  tasks:
+
+    - name: "Windows | Write C:\\ansible_host_id.txt"
+      when: ansible_os_family == "Windows"
+      block:
+        - name: "Create identity file"
+          ansible.windows.win_copy:
+            content: |
+              Ansible-managed host identity
+              Hostname : {{ inventory_hostname }}
+              OS       : {{ ansible_distribution }}
+              Checked  : {{ ansible_date_time.iso8601 }}
+            dest: "C:\\ansible_host_id.txt"
+      rescue:
+        # rescue runs only if the block task fails; surfaces the error cleanly
+        - name: "Report write failure"
+          ansible.builtin.debug:
+            msg: "Identity file write FAILED on {{ inventory_hostname }}: {{ ansible_failed_result.msg }}"
+
+    - name: "Rocky | Write /etc/ansible_host_id"
+      when: ansible_os_family == "RedHat"
+      ansible.builtin.copy:
+        content: |
+          Ansible-managed host identity
+          Hostname : {{ inventory_hostname }}
+          OS       : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Checked  : {{ ansible_date_time.iso8601 }}
+        dest: /etc/ansible_host_id
+        owner: root
+        group: root
+        mode: "0644"
+
+
+# ----------------------------------------------------------------
+# HARDENING-1 | Disable Guest Account (Windows)
+# The built-in Guest account must be disabled on all Windows hosts.
+# win_user with account_disabled: true sets the flag without
+# deleting the account, preserving the audit trail.
+# state: present ensures the task only operates on an existing account
+# and will not create a new account named Guest if it is missing.
+# ----------------------------------------------------------------
+- name: "G01 | Hardening-1 | Disable local Guest account on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable the built-in Guest account"
+      ansible.windows.win_user:
+        name: Guest
+        account_disabled: true
+        state: present   # present = manage existing account; do not delete
+      register: guest_state
+
+    - name: "Confirm Guest account state"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} - Guest disabled: {{ guest_state.account_disabled }}"
+
+
+# ----------------------------------------------------------------
+# HARDENING-2 | Ensure firewalld Running (Rocky)
+# firewalld is the default zone-based firewall for Rocky / RHEL.
+# block/rescue handles the case where the package is missing;
+# rather than failing the entire play, it logs a clear warning.
+# ----------------------------------------------------------------
+- name: "G01 | Hardening-2 | Ensure firewalld is running on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Start and enable firewalld"
+      block:
+        - name: "Ensure firewalld is started and set to start on boot"
+          ansible.builtin.service:
+            name: firewalld
+            state: started
+            enabled: true
+          register: fw_state
+
+        - name: "Confirm firewalld state"
+          ansible.builtin.debug:
+            msg: "firewalld on {{ inventory_hostname }}: started and enabled"
+
+      rescue:
+        # Reached only if the service task throws an error
+        - name: "firewalld unavailable - log warning"
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: firewalld could not be managed on {{ inventory_hostname }}.
+              Verify the package is installed: dnf install -y firewalld
+
+
+# ================================================================
+# GPO HARDENING
+# All three GPO plays run on AD01. The DC has the GroupPolicy
+# PowerShell module installed by default as part of the AD DS role.
+# No GPMC (GUI) is required.
+#
+# GPO Name : Lab-G01-Hardening
+# Linked to: DC=danielr,DC=local (domain root)
+# ================================================================
+
+# ---- GPO-1 | Create GPO and link to domain ----
+# Get-GPO with -ErrorAction SilentlyContinue returns $null when the
+# GPO does not exist, enabling idempotent creation logic.
+# changed_when inspects the stdout sentinel string (CREATED / LINKED)
+# so Ansible accurately tracks state changes.
+- name: "G01 | GPO-1 | Create and link Lab-G01-Hardening"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G01-Hardening"
+    domain_dn: "DC=danielr,DC=local"
+
+  tasks:
+
+    - name: "Create GPO if it does not already exist"
+      ansible.windows.win_shell: |
+        $gpo = Get-GPO -Name "{{ gpo_name }}" -ErrorAction SilentlyContinue
+        if (-not $gpo) { New-GPO -Name "{{ gpo_name }}" | Out-Null; Write-Output "CREATED" }
+        else            { Write-Output "EXISTS" }
+      register: gpo_create
+      changed_when: "'CREATED' in gpo_create.stdout"
+
+    - name: "Link GPO to domain root if not already linked"
+      ansible.windows.win_shell: |
+        $linked = (Get-GPInheritance -Target "{{ domain_dn }}").GpoLinks |
+                    Where-Object { $_.DisplayName -eq "{{ gpo_name }}" }
+        if (-not $linked) {
+            New-GPLink -Name "{{ gpo_name }}" -Target "{{ domain_dn }}" | Out-Null
+            Write-Output "LINKED"
+        } else { Write-Output "ALREADY_LINKED" }
+      register: gpo_link
+      changed_when: "'LINKED' in gpo_link.stdout"
+
+    - name: "Debug GPO creation and link state"
+      ansible.builtin.debug:
+        msg:
+          - "GPO create : {{ gpo_create.stdout | trim }}"
+          - "GPO link   : {{ gpo_link.stdout   | trim }}"
+
+
+# ---- GPO-2 | Disable Autorun on all drive types ----
+# NoDriveTypeAutoRun = 0xFF (255) disables Autorun for every drive
+# type: removable, CD-ROM, network, RAM disk, and unknown.
+# This is a Computer Configuration registry-based policy under
+# HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer.
+- name: "G01 | GPO-2 | Disable Autorun on all drive types"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G01-Hardening"
+
+  tasks:
+
+    - name: "Set NoDriveTypeAutoRun = 255 in GPO (Computer Config)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue `
+          -Name "{{ gpo_name }}" `
+          -Key  "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
+          -ValueName "NoDriveTypeAutoRun" `
+          -Type DWord -Value 255
+        Write-Output "SET"
+      register: autorun_result
+      changed_when: "'SET' in autorun_result.stdout"
+
+    - name: "Debug Autorun GPO result"
+      ansible.builtin.debug:
+        msg: "NoDriveTypeAutoRun=255 set in {{ gpo_name }}: {{ autorun_result.stdout | trim }}"
+
+
+# ---- GPO-3 | Screensaver timeout and password-on-resume ----
+# Both values live under HKCU (User Configuration).
+# ScreenSaveTimeOut is stored as REG_SZ per the Windows spec even
+# though it represents a numeric value (seconds as a string).
+# ScreenSaverIsSecure = "1" requires a password when the screen
+# saver is dismissed, preventing unattended session hijacking.
+- name: "G01 | GPO-3 | Screensaver timeout and password lock"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G01-Hardening"
+    ss_key: 'HKCU\Software\Policies\Microsoft\Windows\Control Panel\Desktop'
+
+  tasks:
+
+    - name: "Set screensaver timeout to 600 seconds (10 minutes)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ ss_key }}" -ValueName "ScreenSaveTimeOut" -Type String -Value "600"
+        Write-Output "SET"
+      register: ss_timeout
+      changed_when: "'SET' in ss_timeout.stdout"
+
+    - name: "Require password on screensaver resume"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ ss_key }}" -ValueName "ScreenSaverIsSecure" -Type String -Value "1"
+        Write-Output "SET"
+      register: ss_secure
+      changed_when: "'SET' in ss_secure.stdout"
+
+    - name: "Debug screensaver GPO values"
+      ansible.builtin.debug:
+        msg:
+          - "ScreenSaveTimeOut   : {{ ss_timeout.stdout | trim }}"
+          - "ScreenSaverIsSecure : {{ ss_secure.stdout  | trim }}"
+
+
+# Force policy refresh on all domain-joined Windows hosts so GPO
+# changes apply immediately without waiting for the 90-minute cycle.
+- name: "G01 | GPO | Force gpupdate on all domain-joined Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Run gpupdate /force"
+      ansible.windows.win_shell: gpupdate /force
+      changed_when: false   # gpupdate is informational; not a state change
+      register: gpu_out
+
+    - name: "Display gpupdate output"
+      ansible.builtin.debug:
+        var: gpu_out.stdout_lines
+
+
+# ================================================================
+# END OF GROUP 01
+# ================================================================
+- name: "G01 | END | 2-second countdown before Group 02"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "Countdown [ 2 ]"
+      ansible.builtin.debug:
+        msg: "Group 01 complete -- [ 2 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Countdown [ 1 ]"
+      ansible.builtin.debug:
+        msg: "Continuing        -- [ 1 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Proceed to Group 02"
+      ansible.builtin.debug:
+        msg: "Next: ansible-playbook group_02.yml [--check]"

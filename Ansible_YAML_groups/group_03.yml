@@ -1,0 +1,306 @@
+---
+# ================================================================
+# Group 03 | Ansible Self-Learning Lab
+# ================================================================
+# Sections:
+#   SysAdmin-1  : Install lab utility packages on Rocky hosts
+#   SysAdmin-2  : Ensure Telnet-Client feature is absent (Windows)
+#   Hardening-1 : Disable SMBv1 server protocol on Windows
+#   Hardening-2 : Set system-wide umask to 0027 on Rocky
+#   GPO-1       : Disable Windows Script Host (Computer Config)
+#   GPO-2       : Restrict Control Panel access (User Config)
+#   GPO-3       : Disable LAN Manager hash storage (Computer Config)
+#
+# Usage:
+#   Dry-run : ansible-playbook group_03.yml --check
+#   Apply   : ansible-playbook group_03.yml
+# ================================================================
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Install Lab Utility Packages on Rocky
+# net-tools supplies ifconfig and netstat - handy for network
+# reconnaissance exercises in the lab.
+# vim is frequently absent on minimal Rocky installs.
+# The dnf module is idempotent: state: present is a no-op when
+# both packages are already installed.
+# ----------------------------------------------------------------
+- name: "G03 | SysAdmin-1 | Install utility packages on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Install net-tools and vim via dnf"
+      ansible.builtin.dnf:
+        name:
+          - net-tools
+          - vim
+        state: present
+      register: pkg_result
+
+    - name: "Report package installation state"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: packages changed={{ pkg_result.changed }}"
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-2 | Remove Telnet-Client Feature on Windows
+# Telnet transmits all data including credentials in plaintext.
+# Removing the client feature reduces attack surface and prevents
+# accidental use. win_feature with state: absent is idempotent.
+# In --check mode this will show whether removal would occur
+# without actually removing the feature.
+# ----------------------------------------------------------------
+- name: "G03 | SysAdmin-2 | Ensure Telnet-Client is absent on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Remove Telnet-Client Windows feature if present"
+      ansible.windows.win_feature:
+        name: Telnet-Client
+        state: absent
+      register: telnet_result
+
+    - name: "Report Telnet-Client feature state"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: Telnet-Client removal
+          changed={{ telnet_result.changed }},
+          reboot_required={{ telnet_result.reboot_required }}
+
+
+# ----------------------------------------------------------------
+# HARDENING-1 | Disable SMBv1 on Windows
+# SMBv1 is the protocol exploited by EternalBlue (MS17-010),
+# WannaCry, and NotPetya. It must be disabled on all Windows hosts.
+#
+# Approach:
+#   1. Read current state with Get-SmbServerConfiguration.
+#   2. Only run the disable command if SMBv1 is currently enabled.
+#      This gives accurate changed_when behavior.
+#   3. Display the final state in debug regardless.
+# ----------------------------------------------------------------
+- name: "G03 | Hardening-1 | Disable SMBv1 server protocol on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    # Read SMBv1 state first so subsequent task only fires when needed.
+    # changed_when: false because this is a read-only check.
+    - name: "Check current SMBv1 server status"
+      ansible.windows.win_shell: |
+        (Get-SmbServerConfiguration).EnableSMB1Protocol
+      register: smb1_check
+      changed_when: false
+
+    # when conditional compares the stdout string (True/False) in lowercase.
+    # | trim removes any trailing newline that PowerShell appends.
+    - name: "Disable SMBv1 server protocol if currently enabled"
+      ansible.windows.win_shell: |
+        Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
+        Write-Output "DISABLED"
+      when: smb1_check.stdout | trim | lower == 'true'
+      register: smb1_result
+      changed_when: "'DISABLED' in smb1_result.stdout"
+
+    - name: "Debug SMBv1 final state"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: SMBv1 was={{ smb1_check.stdout | trim }}.
+          {{ 'Disabled by this play.' if (smb1_result is defined and smb1_result.changed) else 'No change needed.' }}
+
+
+# ----------------------------------------------------------------
+# HARDENING-2 | Set System-Wide umask 0027 on Rocky
+# The default umask 0022 allows group and world read on new files.
+# umask 0027 restricts new files to owner read/write, group read,
+# and no access for others - appropriate for shared server environments.
+#
+# Both /etc/profile (login shells) and /etc/bashrc (interactive
+# non-login shells) are updated to ensure full coverage.
+# lineinfile regexp=^umask matches any existing umask line and
+# replaces it; backup: true saves the original before editing.
+# ----------------------------------------------------------------
+- name: "G03 | Hardening-2 | Set system-wide umask 0027 on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Set umask 0027 in /etc/profile"
+      ansible.builtin.lineinfile:
+        path: /etc/profile
+        regexp: "^umask "
+        line: "umask 0027"
+        backup: true
+      register: umask_profile
+
+    - name: "Set umask 0027 in /etc/bashrc"
+      ansible.builtin.lineinfile:
+        path: /etc/bashrc
+        regexp: "^umask "
+        line: "umask 0027"
+        backup: true
+      register: umask_bashrc
+
+    - name: "Debug umask changes"
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: /etc/profile changed={{ umask_profile.changed }}"
+          - "{{ inventory_hostname }}: /etc/bashrc  changed={{ umask_bashrc.changed }}"
+
+
+# ================================================================
+# GPO HARDENING
+# GPO Name : Lab-G03-Hardening
+# Linked to: DC=danielr,DC=local
+# ================================================================
+
+# ---- GPO-1 | Disable Windows Script Host ----
+# Windows Script Host (WSH) runs VBScript and JScript files directly
+# on the desktop (.vbs, .js, .wsf). It is a common initial-access
+# vector in phishing and malware delivery.
+# Enabled = 0 under HKLM disables WSH system-wide (Computer Config).
+- name: "G03 | GPO-1 | Disable Windows Script Host via GPO"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G03-Hardening"
+    domain_dn: "DC=danielr,DC=local"
+
+  tasks:
+
+    - name: "Create and link Lab-G03-Hardening GPO if needed"
+      ansible.windows.win_shell: |
+        if (-not (Get-GPO -Name "{{ gpo_name }}" -EA SilentlyContinue)) {
+            New-GPO  -Name "{{ gpo_name }}" | Out-Null
+            New-GPLink -Name "{{ gpo_name }}" -Target "{{ domain_dn }}" | Out-Null
+            Write-Output "CREATED_AND_LINKED"
+        } else { Write-Output "EXISTS" }
+      register: gpo_g03
+      changed_when: "'CREATED' in gpo_g03.stdout"
+
+    - name: "Set WSH Enabled = 0 (disable Windows Script Host, Computer Config)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKLM\Software\Microsoft\Windows Script Host\Settings" `
+          -ValueName "Enabled" -Type DWord -Value 0
+        Write-Output "SET"
+      register: wsh_result
+      changed_when: "'SET' in wsh_result.stdout"
+
+    - name: "Debug WSH disable result"
+      ansible.builtin.debug:
+        msg:
+          - "GPO state  : {{ gpo_g03.stdout  | trim }}"
+          - "WSH result : {{ wsh_result.stdout | trim }}"
+
+
+# ---- GPO-2 | Restrict Control Panel Access ----
+# NoControlPanel = 1 under HKCU prevents standard users from
+# opening Control Panel or the Settings app. This enforces
+# administrator-only configuration changes on managed workstations.
+# This is a User Configuration (HKCU) registry-based policy.
+- name: "G03 | GPO-2 | Restrict Control Panel access for standard users"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G03-Hardening"
+
+  tasks:
+
+    - name: "Set NoControlPanel = 1 in GPO (User Config - HKCU)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
+          -ValueName "NoControlPanel" -Type DWord -Value 1
+        Write-Output "SET"
+      register: cp_result
+      changed_when: "'SET' in cp_result.stdout"
+
+    - name: "Debug Control Panel restriction result"
+      ansible.builtin.debug:
+        msg: "NoControlPanel=1 set in {{ gpo_name }}: {{ cp_result.stdout | trim }}"
+
+
+# ---- GPO-3 | Disable LAN Manager Hash Storage ----
+# Windows can store both an LM hash and an NT hash for each password.
+# LM hashes use DES with a 7-character split, making them trivially
+# crackable with modern tools. NoLMHash = 1 tells the system not to
+# store LM hashes in the SAM database on next password change.
+# This is a Computer Configuration (HKLM) policy.
+- name: "G03 | GPO-3 | Disable LAN Manager hash storage in SAM"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G03-Hardening"
+
+  tasks:
+
+    - name: "Set NoLMHash = 1 to stop LM hash storage (Computer Config)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" `
+          -ValueName "NoLMHash" -Type DWord -Value 1
+        Write-Output "SET"
+      register: lmhash_result
+      changed_when: "'SET' in lmhash_result.stdout"
+
+    - name: "Debug NoLMHash result"
+      ansible.builtin.debug:
+        msg: "NoLMHash=1 set in {{ gpo_name }}: {{ lmhash_result.stdout | trim }}"
+
+
+- name: "G03 | GPO | Force gpupdate on all domain-joined Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Run gpupdate /force"
+      ansible.windows.win_shell: gpupdate /force
+      changed_when: false
+      register: gpu_out
+
+    - name: "Display gpupdate output"
+      ansible.builtin.debug:
+        var: gpu_out.stdout_lines
+
+
+# ================================================================
+# END OF GROUP 03
+# ================================================================
+- name: "G03 | END | 2-second countdown before Group 04"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "Countdown [ 2 ]"
+      ansible.builtin.debug:
+        msg: "Group 03 complete -- [ 2 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Countdown [ 1 ]"
+      ansible.builtin.debug:
+        msg: "Continuing        -- [ 1 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Proceed to Group 04"
+      ansible.builtin.debug:
+        msg: "Next: ansible-playbook group_04.yml [--check]"

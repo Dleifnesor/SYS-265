@@ -1,0 +1,394 @@
+---
+# ================================================================
+# Group 02 | Ansible Self-Learning Lab
+# ================================================================
+# Sections:
+#   SysAdmin-1  : Verify core remoting services (WinRM / sshd)
+#   SysAdmin-2  : Create a local lab user on all hosts
+#   Hardening-1 : Disable LLMNR via registry (Windows)
+#   Hardening-2 : Harden sshd_config on Rocky hosts
+#   GPO-1       : Set domain account lockout policy via AD cmdlet
+#   GPO-2       : Apply a legal notice banner (Computer Config)
+#   GPO-3       : Disable cmd.exe for standard users (User Config)
+#
+# Usage:
+#   Dry-run : ansible-playbook group_02.yml --check
+#   Apply   : ansible-playbook group_02.yml
+# ================================================================
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Verify Core Remoting Services
+# WinRM is the transport Ansible uses to manage Windows hosts.
+# sshd is the transport for Rocky hosts.
+# win_service and ansible.builtin.service are idempotent: if the
+# service is already running, the task reports no change.
+# ----------------------------------------------------------------
+- name: "G02 | SysAdmin-1 | Verify WinRM is running on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    # WinRM must be running AND set to auto-start so it survives a
+    # reboot. start_mode: auto prevents a situation where WinRM is
+    # running but would not come back after the next restart.
+    - name: "Ensure WinRM is started and set to auto-start"
+      ansible.windows.win_service:
+        name: WinRM
+        state: started
+        start_mode: auto
+      register: winrm_state
+
+    - name: "Display WinRM service state"
+      ansible.builtin.debug:
+        msg: "WinRM on {{ inventory_hostname }}: state={{ winrm_state.state }}"
+
+
+- name: "G02 | SysAdmin-1 | Verify sshd is running on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Ensure sshd is started and enabled at boot"
+      ansible.builtin.service:
+        name: sshd
+        state: started
+        enabled: true
+      register: sshd_state
+
+    - name: "Display sshd service state"
+      ansible.builtin.debug:
+        msg: "sshd on {{ inventory_hostname }}: running and enabled"
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-2 | Create Local Lab User
+# Creates a non-privileged local account 'labuser' on every host
+# for testing authentication and permission scenarios.
+#
+# Windows: win_user handles local accounts directly.
+# Rocky  : ansible.builtin.user with a SHA-512 hashed password.
+#          update_password: on_create prevents overwriting the
+#          password on subsequent runs (idempotent behavior).
+#
+# IMPORTANT: Do not store plaintext passwords in playbooks in
+# production. Use ansible-vault or an external secrets manager.
+# ----------------------------------------------------------------
+- name: "G02 | SysAdmin-2 | Create local lab user on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    lab_user: "labuser"
+    lab_pass: "LabP@ss2024!"   # example only - use ansible-vault in practice
+
+  tasks:
+
+    - name: "Create local account 'labuser' on Windows"
+      ansible.windows.win_user:
+        name: "{{ lab_user }}"
+        password: "{{ lab_pass }}"
+        state: present
+        account_disabled: false
+        password_never_expires: false
+        update_password: on_create   # skip password change if account exists
+      register: win_user_result
+
+    - name: "Debug Windows user creation result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} - labuser state: {{ win_user_result.state }}"
+
+
+- name: "G02 | SysAdmin-2 | Create local lab user on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  vars:
+    lab_user: "labuser"
+    # Generate a hash before running:
+    #   python3 -c "import crypt; print(crypt.crypt('LabP@ss2024!', crypt.mksalt(crypt.METHOD_SHA512)))"
+    # Replace the placeholder below with the actual SHA-512 hash output.
+    lab_pass_hash: "$6$replacethissalt$replacewithrealSHA512hashoutputhere"
+
+  tasks:
+
+    - name: "Create local account 'labuser' on Rocky"
+      ansible.builtin.user:
+        name: "{{ lab_user }}"
+        password: "{{ lab_pass_hash }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+        update_password: on_create
+      register: rocky_user_result
+
+    - name: "Debug Rocky user creation result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} - labuser uid={{ rocky_user_result.uid | default('already exists') }}"
+
+
+# ----------------------------------------------------------------
+# HARDENING-1 | Disable LLMNR on Windows
+# LLMNR (Link-Local Multicast Name Resolution) falls back to
+# multicast queries when DNS fails. Responder and similar tools
+# abuse this to perform MITM credential capture.
+# Disabling it via policy forces name resolution through DNS only.
+#
+# Registry path : HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient
+# Value         : EnableMulticast = 0 (DWORD)
+#
+# win_regedit is the preferred module for direct registry edits on
+# target hosts (as opposed to GPO-managed registry through AD01).
+# ----------------------------------------------------------------
+- name: "G02 | Hardening-1 | Disable LLMNR on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Set EnableMulticast = 0 to disable LLMNR"
+      ansible.windows.win_regedit:
+        path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'
+        name: EnableMulticast
+        data: 0
+        type: dword
+      register: llmnr_result
+
+    - name: "Debug LLMNR registry result"
+      ansible.builtin.debug:
+        msg: "LLMNR disabled on {{ inventory_hostname }}: changed={{ llmnr_result.changed }}"
+
+
+# ----------------------------------------------------------------
+# HARDENING-2 | Harden sshd_config on Rocky
+# MaxAuthTries 4  : Limits authentication attempts per connection,
+#                   slowing brute-force without blocking lockouts.
+# PermitRootLogin no : Requires admins to log in as a normal user
+#                      and escalate; prevents direct root compromise.
+#
+# lineinfile with regexp+line is idempotent: it updates an existing
+# directive (commented or uncommented) rather than appending a duplicate.
+# backup: true creates a .bak copy before any edit.
+# A handler restarts sshd ONLY when a change is made, avoiding
+# unnecessary service disruptions on re-runs.
+# ----------------------------------------------------------------
+- name: "G02 | Hardening-2 | Harden sshd_config on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  handlers:
+    # Handlers run once at the end of a play if notified at least once.
+    # Using a handler instead of a direct restart task prevents sshd
+    # from restarting multiple times when several directives change.
+    - name: "Restart sshd"
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+  tasks:
+
+    - name: "Set MaxAuthTries to 4"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?MaxAuthTries"
+        line: "MaxAuthTries 4"
+        backup: true
+      notify: "Restart sshd"
+
+    - name: "Disable direct root SSH login"
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "^#?PermitRootLogin"
+        line: "PermitRootLogin no"
+        backup: true
+      notify: "Restart sshd"
+
+    # sshd -t performs a syntax check without restarting the service.
+    # Running this BEFORE the handler fires catches config errors early.
+    - name: "Validate sshd_config syntax"
+      ansible.builtin.command: sshd -t
+      changed_when: false
+      register: sshd_check
+
+    - name: "Display sshd syntax check result"
+      ansible.builtin.debug:
+        msg: >-
+          sshd config syntax on {{ inventory_hostname }}:
+          {{ 'VALID' if sshd_check.rc == 0 else 'ERROR - review sshd_config before restart' }}
+
+
+# ================================================================
+# GPO HARDENING
+# GPO Name : Lab-G02-Hardening
+# Linked to: DC=danielr,DC=local
+# ================================================================
+
+# ---- GPO-1 | Domain Account Lockout Policy ----
+# Set-ADDefaultDomainPasswordPolicy targets the built-in domain
+# password policy object (equivalent to Default Domain Policy
+# security settings) using only PowerShell - no GPMC needed.
+# LockoutThreshold=5 limits guessing attempts.
+# LockoutDuration and LockoutObservationWindow both set to 30 min.
+- name: "G02 | GPO-1 | Set domain account lockout policy"
+  hosts: AD01
+  gather_facts: false
+
+  tasks:
+
+    - name: "Apply lockout policy via Set-ADDefaultDomainPasswordPolicy"
+      ansible.windows.win_shell: |
+        Set-ADDefaultDomainPasswordPolicy `
+          -Identity "danielr.local" `
+          -LockoutThreshold 5 `
+          -LockoutDuration "00:30:00" `
+          -LockoutObservationWindow "00:30:00"
+        Write-Output "SET"
+      register: lockout_result
+      changed_when: "'SET' in lockout_result.stdout"
+
+    # Verify the values were applied correctly; changed_when: false
+    # because this is a read-only confirmation step.
+    - name: "Read back current lockout policy for verification"
+      ansible.windows.win_shell: |
+        Get-ADDefaultDomainPasswordPolicy -Identity "danielr.local" |
+          Select-Object LockoutThreshold, LockoutDuration, LockoutObservationWindow |
+          Format-List
+      register: lockout_verify
+      changed_when: false
+
+    - name: "Display lockout policy"
+      ansible.builtin.debug:
+        var: lockout_verify.stdout_lines
+
+
+# ---- GPO-2 | Legal Notice Banner ----
+# Displays an authorization warning on the Windows logon screen.
+# LegalNoticeCaption = title bar text shown before login.
+# LegalNoticeText    = body text with the policy statement.
+# Both are Computer Configuration (HKLM) GPO registry values.
+# The GPO is created and linked here if it does not yet exist.
+- name: "G02 | GPO-2 | Set legal notice banner on domain hosts"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G02-Hardening"
+    domain_dn: "DC=danielr,DC=local"
+    notice_key: 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+
+  tasks:
+
+    # Combined create-and-link in one shell block to reduce task count.
+    # The if/else writes a sentinel string for changed_when detection.
+    - name: "Create Lab-G02-Hardening GPO and link to domain if needed"
+      ansible.windows.win_shell: |
+        if (-not (Get-GPO -Name "{{ gpo_name }}" -EA SilentlyContinue)) {
+            New-GPO  -Name "{{ gpo_name }}" | Out-Null
+            New-GPLink -Name "{{ gpo_name }}" -Target "{{ domain_dn }}" | Out-Null
+            Write-Output "CREATED_AND_LINKED"
+        } else { Write-Output "EXISTS" }
+      register: gpo_g02
+      changed_when: "'CREATED' in gpo_g02.stdout"
+
+    - name: "Set LegalNoticeCaption in GPO"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ notice_key }}" -ValueName "LegalNoticeCaption" `
+          -Type String -Value "DANIELR.LOCAL - Authorized Access Only"
+        Write-Output "SET"
+      register: caption_result
+      changed_when: "'SET' in caption_result.stdout"
+
+    - name: "Set LegalNoticeText in GPO"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ notice_key }}" -ValueName "LegalNoticeText" `
+          -Type String -Value "This system is for authorized use only. Unauthorized access is prohibited and monitored."
+        Write-Output "SET"
+      register: text_result
+      changed_when: "'SET' in text_result.stdout"
+
+    - name: "Debug legal notice results"
+      ansible.builtin.debug:
+        msg:
+          - "GPO state   : {{ gpo_g02.stdout    | trim }}"
+          - "Caption set : {{ caption_result.stdout | trim }}"
+          - "Text set    : {{ text_result.stdout    | trim }}"
+
+
+# ---- GPO-3 | Disable cmd.exe for standard users ----
+# DisableCMD = 1 prevents cmd.exe from launching for non-admin accounts.
+# DisableCMD = 2 blocks only .bat / .cmd batch file execution.
+# Value 1 is used here for stricter control in the lab environment.
+# This is a User Configuration (HKCU) registry-based GPO policy.
+- name: "G02 | GPO-3 | Disable cmd.exe for standard domain users"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G02-Hardening"
+
+  tasks:
+
+    - name: "Set DisableCMD = 1 in GPO (User Config - HKCU)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKCU\Software\Policies\Microsoft\Windows\System" `
+          -ValueName "DisableCMD" -Type DWord -Value 1
+        Write-Output "SET"
+      register: cmd_result
+      changed_when: "'SET' in cmd_result.stdout"
+
+    - name: "Debug DisableCMD result"
+      ansible.builtin.debug:
+        msg: "DisableCMD=1 set in {{ gpo_name }}: {{ cmd_result.stdout | trim }}"
+
+
+- name: "G02 | GPO | Force gpupdate on all domain-joined Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Run gpupdate /force"
+      ansible.windows.win_shell: gpupdate /force
+      changed_when: false
+      register: gpu_out
+
+    - name: "Display gpupdate output"
+      ansible.builtin.debug:
+        var: gpu_out.stdout_lines
+
+
+# ================================================================
+# END OF GROUP 02
+# ================================================================
+- name: "G02 | END | 2-second countdown before Group 03"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "Countdown [ 2 ]"
+      ansible.builtin.debug:
+        msg: "Group 02 complete -- [ 2 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Countdown [ 1 ]"
+      ansible.builtin.debug:
+        msg: "Continuing        -- [ 1 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Proceed to Group 03"
+      ansible.builtin.debug:
+        msg: "Next: ansible-playbook group_03.yml [--check]"

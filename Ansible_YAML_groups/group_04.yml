@@ -1,0 +1,353 @@
+---
+# ================================================================
+# Group 04 | Ansible Self-Learning Lab
+# ================================================================
+# Sections:
+#   SysAdmin-1  : Gather and display key facts from all hosts
+#   SysAdmin-2  : Manage service state (Spooler on Windows / crond on Rocky)
+#   Hardening-1 : Disable NetBIOS over TCP/IP on Windows
+#   Hardening-2 : Set sudo session timeout on Rocky
+#   GPO-1       : Enforce Windows Defender Firewall for all 3 profiles
+#   GPO-2       : Restrict anonymous SAM account enumeration
+#   GPO-3       : Require NTLMv2 via LmCompatibilityLevel = 5
+#
+# Usage:
+#   Dry-run : ansible-playbook group_04.yml --check
+#   Apply   : ansible-playbook group_04.yml
+# ================================================================
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Gather and Display Key Facts
+# gather_facts: true triggers the setup/win_setup module on each
+# host. Selected variables are surfaced via debug as a pre-flight
+# snapshot - useful for confirming inventory accuracy before
+# applying configuration changes to the full environment.
+# ----------------------------------------------------------------
+- name: "G04 | SysAdmin-1 | Gather and display key system facts from all hosts"
+  hosts: all
+  gather_facts: true
+
+  tasks:
+
+    # ansible_all_ipv4_addresses is a list; join() converts it to a
+    # comma-separated string for readable output.
+    # default() handles hosts where a fact may not be populated.
+    - name: "Display selected system facts per host"
+      ansible.builtin.debug:
+        msg:
+          - "Host         : {{ inventory_hostname }}"
+          - "OS Family    : {{ ansible_os_family }}"
+          - "Distribution : {{ ansible_distribution }} {{ ansible_distribution_version | default('') }}"
+          - "Architecture : {{ ansible_architecture }}"
+          - "IP Addresses : {{ ansible_all_ipv4_addresses | default([]) | join(', ') }}"
+          - "Uptime (sec) : {{ ansible_uptime_seconds | default('N/A') }}"
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-2 | Manage Print Spooler and crond Service States
+# PrintNightmare (CVE-2021-1675 / CVE-2021-34527) exploits the
+# Print Spooler service. Disabling it on the DC (AD01) is a
+# well-known mitigation. MGMT01 and WKS01 may legitimately need it.
+# A 'when' conditional on inventory_hostname isolates the change
+# to AD01 without requiring a separate play.
+# ----------------------------------------------------------------
+- name: "G04 | SysAdmin-2 | Manage Print Spooler state on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    # Stop and disable Spooler only on the domain controller.
+    - name: "Stop and disable Print Spooler on AD01 (PrintNightmare mitigation)"
+      ansible.windows.win_service:
+        name: Spooler
+        state: stopped
+        start_mode: disabled
+      when: inventory_hostname == "AD01"
+      register: spooler_dc
+
+    # Non-DC Windows hosts retain the Spooler for printing capability.
+    - name: "Ensure Print Spooler is running on MGMT01 and WKS01"
+      ansible.windows.win_service:
+        name: Spooler
+        state: started
+        start_mode: auto
+      when: inventory_hostname != "AD01"
+      register: spooler_other
+
+    - name: "Debug Spooler state per host"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: Spooler set to
+          {{ 'stopped + disabled (DC hardening)' if inventory_hostname == 'AD01'
+             else 'started + auto (member host)' }}
+
+
+- name: "G04 | SysAdmin-2 | Ensure crond is running on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Start and enable crond at boot"
+      ansible.builtin.service:
+        name: crond
+        state: started
+        enabled: true
+      register: crond_result
+
+    - name: "Debug crond state"
+      ansible.builtin.debug:
+        msg: "crond on {{ inventory_hostname }}: started and enabled={{ crond_result.enabled | default(true) }}"
+
+
+# ----------------------------------------------------------------
+# HARDENING-1 | Disable NetBIOS over TCP/IP on Windows
+# NetBIOS name resolution is actively exploited by tools such as
+# Responder for NBT-NS poisoning and MITM credential capture.
+# Disabling it on all enabled adapters forces name resolution
+# through DNS only.
+#
+# SetTcpipNetbios(2) sets NetbiosOptions=2 (Disable NetBIOS).
+# Values: 0=default (DHCP), 1=enable, 2=disable.
+# Get-WmiObject iterates all IP-enabled adapters to catch
+# multi-homed hosts like AD01 (which may have multiple NICs).
+# ----------------------------------------------------------------
+- name: "G04 | Hardening-1 | Disable NetBIOS over TCP/IP on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Disable NetBIOS on all IP-enabled adapters via WMI"
+      ansible.windows.win_shell: |
+        $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration |
+                    Where-Object { $_.IPEnabled -eq $true }
+        $results = @()
+        foreach ($adapter in $adapters) {
+            $ret = $adapter.SetTcpipNetbios(2)
+            $results += "$($adapter.Description): ReturnCode=$($ret.ReturnValue)"
+        }
+        $results -join "`n"
+        Write-Output "DONE"
+      register: netbios_result
+      # ReturnValue 0 = success, 84 = not required (already set).
+      # We flag changed only when the script actually ran to completion.
+      changed_when: "'DONE' in netbios_result.stdout"
+
+    - name: "Display per-adapter NetBIOS disable results"
+      ansible.builtin.debug:
+        var: netbios_result.stdout_lines
+
+
+# ----------------------------------------------------------------
+# HARDENING-2 | Sudo Session Timeout on Rocky
+# By default sudo caches credentials for 5 minutes (timestamp_timeout=5).
+# Setting a short explicit value documents intent and prevents the
+# default from being quietly changed by a package update.
+# timestamp_timeout=5 is a reasonable balance between security and
+# usability in a lab environment.
+#
+# The drop-in file pattern (/etc/sudoers.d/) is preferred over
+# editing /etc/sudoers directly. The validate parameter runs
+# 'visudo -cf <tmpfile>' before writing to catch syntax errors.
+# mode: "0440" is required; sudo refuses files with looser permissions.
+# ----------------------------------------------------------------
+- name: "G04 | Hardening-2 | Set sudo timestamp_timeout on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Deploy sudoers drop-in for timestamp_timeout"
+      ansible.builtin.copy:
+        content: |
+          # Ansible-managed: require re-authentication after 5 minutes of sudo inactivity
+          Defaults timestamp_timeout=5
+        dest: /etc/sudoers.d/99-ansible-timeout
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"   # %s is replaced with the temp file path
+      register: sudo_result
+
+    - name: "Debug sudo timeout deployment"
+      ansible.builtin.debug:
+        msg: "sudo timeout config on {{ inventory_hostname }}: changed={{ sudo_result.changed }}"
+
+
+# ================================================================
+# GPO HARDENING
+# GPO Name : Lab-G04-Hardening
+# Linked to: DC=danielr,DC=local
+# ================================================================
+
+# ---- GPO-1 | Enforce Windows Defender Firewall for all profiles ----
+# EnableFirewall = 1 is set for all three network profiles so that
+# the firewall cannot be disabled by local administrators.
+# Each profile lives under a separate subkey:
+#   DomainProfile  : applies on domain-joined networks
+#   StandardProfile: applies on private non-domain networks
+#   PublicProfile  : applies on public / unknown networks
+- name: "G04 | GPO-1 | Enforce Windows Defender Firewall for all profiles"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G04-Hardening"
+    domain_dn: "DC=danielr,DC=local"
+    fw_base: 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall'
+
+  tasks:
+
+    - name: "Create and link Lab-G04-Hardening GPO if needed"
+      ansible.windows.win_shell: |
+        if (-not (Get-GPO -Name "{{ gpo_name }}" -EA SilentlyContinue)) {
+            New-GPO  -Name "{{ gpo_name }}" | Out-Null
+            New-GPLink -Name "{{ gpo_name }}" -Target "{{ domain_dn }}" | Out-Null
+            Write-Output "CREATED_AND_LINKED"
+        } else { Write-Output "EXISTS" }
+      register: gpo_g04
+      changed_when: "'CREATED' in gpo_g04.stdout"
+
+    - name: "Enable firewall - Domain profile"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ fw_base }}\DomainProfile" `
+          -ValueName "EnableFirewall" -Type DWord -Value 1
+        Write-Output "SET"
+      register: fw_domain
+      changed_when: "'SET' in fw_domain.stdout"
+
+    - name: "Enable firewall - Private (Standard) profile"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ fw_base }}\StandardProfile" `
+          -ValueName "EnableFirewall" -Type DWord -Value 1
+        Write-Output "SET"
+      register: fw_private
+      changed_when: "'SET' in fw_private.stdout"
+
+    - name: "Enable firewall - Public profile"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ fw_base }}\PublicProfile" `
+          -ValueName "EnableFirewall" -Type DWord -Value 1
+        Write-Output "SET"
+      register: fw_public
+      changed_when: "'SET' in fw_public.stdout"
+
+    - name: "Debug firewall GPO profile results"
+      ansible.builtin.debug:
+        msg:
+          - "Domain  profile firewall: {{ fw_domain.stdout  | trim }}"
+          - "Private profile firewall: {{ fw_private.stdout | trim }}"
+          - "Public  profile firewall: {{ fw_public.stdout  | trim }}"
+
+
+# ---- GPO-2 | Restrict Anonymous SAM Enumeration ----
+# RestrictAnonymousSAM = 1 prevents unauthenticated (anonymous)
+# connections from enumerating local account names via the SAM
+# database. This closes a common reconnaissance path used to
+# enumerate valid usernames before password attacks.
+- name: "G04 | GPO-2 | Restrict anonymous SAM account enumeration"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G04-Hardening"
+
+  tasks:
+
+    - name: "Set RestrictAnonymousSAM = 1 (Computer Config - HKLM)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" `
+          -ValueName "RestrictAnonymousSAM" -Type DWord -Value 1
+        Write-Output "SET"
+      register: sam_result
+      changed_when: "'SET' in sam_result.stdout"
+
+    - name: "Debug SAM restriction result"
+      ansible.builtin.debug:
+        msg: "RestrictAnonymousSAM=1 set in {{ gpo_name }}: {{ sam_result.stdout | trim }}"
+
+
+# ---- GPO-3 | Require NTLMv2 (LmCompatibilityLevel = 5) ----
+# LmCompatibilityLevel controls which challenge/response auth
+# protocols the host will send and accept:
+#   0-2 : allow LM and NTLM (insecure, legacy)
+#   3   : send NTLMv2 only
+#   4   : refuse LM; accept NTLMv2
+#   5   : refuse LM and NTLM; NTLMv2 only  <-- most secure
+# Setting 5 here prevents downgrade attacks to the weaker protocols.
+- name: "G04 | GPO-3 | Set LmCompatibilityLevel = 5 to require NTLMv2"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G04-Hardening"
+
+  tasks:
+
+    - name: "Set LmCompatibilityLevel = 5 in GPO (Computer Config - HKLM)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" `
+          -ValueName "LmCompatibilityLevel" -Type DWord -Value 5
+        Write-Output "SET"
+      register: ntlm_result
+      changed_when: "'SET' in ntlm_result.stdout"
+
+    - name: "Debug NTLMv2 result"
+      ansible.builtin.debug:
+        msg: "LmCompatibilityLevel=5 set in {{ gpo_name }}: {{ ntlm_result.stdout | trim }}"
+
+
+- name: "G04 | GPO | Force gpupdate on all domain-joined Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Run gpupdate /force"
+      ansible.windows.win_shell: gpupdate /force
+      changed_when: false
+      register: gpu_out
+
+    - name: "Display gpupdate output"
+      ansible.builtin.debug:
+        var: gpu_out.stdout_lines
+
+
+# ================================================================
+# END OF GROUP 04
+# ================================================================
+- name: "G04 | END | 2-second countdown before Group 05"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "Countdown [ 2 ]"
+      ansible.builtin.debug:
+        msg: "Group 04 complete -- [ 2 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Countdown [ 1 ]"
+      ansible.builtin.debug:
+        msg: "Continuing        -- [ 1 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Proceed to Group 05"
+      ansible.builtin.debug:
+        msg: "Next: ansible-playbook group_05.yml [--check]"

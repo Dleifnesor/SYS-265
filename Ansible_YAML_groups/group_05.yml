@@ -1,0 +1,415 @@
+---
+# ================================================================
+# Group 05 | Ansible Self-Learning Lab
+# ================================================================
+# Sections:
+#   SysAdmin-1  : Schedule a disk-report cron job (Rocky) and read
+#                 Windows Security event log entry counts (Windows)
+#   SysAdmin-2  : Deploy a consistent login banner to all hosts
+#   Hardening-1 : Enforce UAC registry settings on Windows hosts
+#   Hardening-2 : Blacklist usb-storage kernel module on Rocky
+#   GPO-1       : Set minimum password length + complexity via AD cmdlet
+#   GPO-2       : Require SMB signing on the server service
+#   GPO-3       : Restrict anonymous access to named pipes and shares
+#
+# Usage:
+#   Dry-run : ansible-playbook group_05.yml --check
+#   Apply   : ansible-playbook group_05.yml
+# ================================================================
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Scheduled Cron Job (Rocky)
+# Creates a named cron entry for root that runs df and pipes
+# output to logger, writing to syslog under the tag "disk-report".
+# The cron module is idempotent: re-running the play updates the
+# entry rather than creating a duplicate.
+# cron_file writes to /etc/cron.d/ansible-disk-report rather than
+# editing the root crontab directly, keeping cron changes auditable.
+# ----------------------------------------------------------------
+- name: "G05 | SysAdmin-1 | Schedule daily disk-usage cron job on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Create /etc/cron.d/ansible-disk-report"
+      ansible.builtin.cron:
+        name: "ansible-disk-report"
+        cron_file: ansible-disk-report   # writes to /etc/cron.d/ instead of user crontab
+        minute: "0"
+        hour: "6"
+        job: "df -h | logger -t disk-report"
+        user: root
+        state: present
+      register: cron_result
+
+    - name: "Debug cron job result"
+      ansible.builtin.debug:
+        msg: "Cron job on {{ inventory_hostname }}: changed={{ cron_result.changed }}"
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-1 | Windows Security Event Log Count
+# Sampling the Security log entry count gives a quick indicator
+# of audit health and activity level on each Windows host.
+# -Newest 1000 limits the query scope to avoid timeout on hosts
+# with very large logs. changed_when: false marks it read-only.
+# ----------------------------------------------------------------
+- name: "G05 | SysAdmin-1 | Check Security event log count on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Count recent Security event log entries (newest 1000)"
+      ansible.windows.win_shell: |
+        $count = (Get-EventLog -LogName Security -Newest 1000 -ErrorAction SilentlyContinue).Count
+        Write-Output "Security log sample count on ${env:COMPUTERNAME}: $count entries"
+      register: evtlog_result
+      changed_when: false
+
+    - name: "Display event log count"
+      ansible.builtin.debug:
+        var: evtlog_result.stdout_lines
+
+
+# ----------------------------------------------------------------
+# SYSADMIN-2 | Deploy Login Banner to All Hosts
+# A consistent authorization banner communicates policy, supports
+# legal standing in security incidents, and is required by many
+# compliance frameworks.
+# Windows: file dropped to C:\lab_banner.txt (referenced by GPO
+#          LegalNoticeText configured in Group 02).
+# Rocky  : /etc/motd is displayed immediately after SSH login.
+# ----------------------------------------------------------------
+- name: "G05 | SysAdmin-2 | Deploy login banner to all hosts"
+  hosts: all
+  gather_facts: true
+
+  vars:
+    banner_text: |
+      ============================================================
+       DANIELR.LOCAL - Authorized access only.
+       All sessions are monitored and logged.
+       Disconnect immediately if you are not an authorized user.
+      ============================================================
+
+  tasks:
+
+    - name: "Windows | Drop banner to C:\\lab_banner.txt"
+      ansible.windows.win_copy:
+        content: "{{ banner_text }}"
+        dest: "C:\\lab_banner.txt"
+      when: ansible_os_family == "Windows"
+
+    - name: "Rocky | Write authorization banner to /etc/motd"
+      ansible.builtin.copy:
+        content: "{{ banner_text }}"
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: "0644"
+      when: ansible_os_family == "RedHat"
+
+
+# ----------------------------------------------------------------
+# HARDENING-1 | Enforce UAC Settings via Registry (Windows)
+# User Account Control (UAC) prevents silent privilege escalation.
+# These three values enforce the most secure UAC configuration:
+#
+#   EnableLUA = 1
+#     Enables UAC entirely. Setting to 0 turns off all prompts and
+#     makes every process run with full administrator context.
+#
+#   ConsentPromptBehaviorAdmin = 2
+#     Prompts admins for credentials (not just a click-through).
+#     Value 1 = prompt on secure desktop (consent only).
+#     Value 2 = prompt for credentials.
+#
+#   PromptOnSecureDesktop = 1
+#     Displays the UAC prompt on the secure desktop (isolated input
+#     desktop), preventing "shatter attacks" from a lower-privilege
+#     process injecting input into the prompt window.
+# ----------------------------------------------------------------
+- name: "G05 | Hardening-1 | Enforce UAC registry settings on Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  vars:
+    uac_key: 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+
+  tasks:
+
+    - name: "Ensure UAC is enabled (EnableLUA = 1)"
+      ansible.windows.win_regedit:
+        path: "{{ uac_key }}"
+        name: EnableLUA
+        data: 1
+        type: dword
+      register: uac_lua
+
+    - name: "Require admin credential prompt (ConsentPromptBehaviorAdmin = 2)"
+      ansible.windows.win_regedit:
+        path: "{{ uac_key }}"
+        name: ConsentPromptBehaviorAdmin
+        data: 2
+        type: dword
+      register: uac_consent
+
+    - name: "Prompt on secure desktop (PromptOnSecureDesktop = 1)"
+      ansible.windows.win_regedit:
+        path: "{{ uac_key }}"
+        name: PromptOnSecureDesktop
+        data: 1
+        type: dword
+      register: uac_desktop
+
+    - name: "Debug UAC registry change summary"
+      ansible.builtin.debug:
+        msg:
+          - "EnableLUA changed              : {{ uac_lua.changed }}"
+          - "ConsentPromptBehaviorAdmin chg : {{ uac_consent.changed }}"
+          - "PromptOnSecureDesktop changed  : {{ uac_desktop.changed }}"
+
+
+# ----------------------------------------------------------------
+# HARDENING-2 | Blacklist usb-storage Kernel Module (Rocky)
+# The usb-storage module enables USB mass storage devices (thumb
+# drives, external HDDs). Blacklisting it prevents data exfiltration
+# and malware delivery via USB media.
+#
+# Two lines are written to the drop-in config:
+#   blacklist usb-storage      : prevents auto-load by udev
+#   install usb-storage /bin/false : blocks manual modprobe attempts
+#
+# dracut --force rebuilds the initramfs so the blacklist is baked
+# in at boot. It only runs when the config file actually changed,
+# avoiding a full initramfs rebuild on every playbook run.
+# ----------------------------------------------------------------
+- name: "G05 | Hardening-2 | Blacklist usb-storage module on Rocky hosts"
+  hosts: rocky
+  gather_facts: false
+
+  tasks:
+
+    - name: "Write modprobe blacklist for usb-storage"
+      ansible.builtin.copy:
+        content: |
+          # Ansible-managed: disable USB mass storage devices
+          blacklist usb-storage
+          install usb-storage /bin/false
+        dest: /etc/modprobe.d/ansible-disable-usb-storage.conf
+        owner: root
+        group: root
+        mode: "0644"
+      register: usb_result
+
+    # dracut --force re-generates the initramfs for the running kernel.
+    # This is only needed when the blacklist file was just created or
+    # changed; using 'when: usb_result.changed' prevents running it
+    # unnecessarily on subsequent playbook executions.
+    - name: "Rebuild initramfs via dracut to apply blacklist"
+      ansible.builtin.command: dracut --force
+      when: usb_result.changed
+      register: dracut_result
+      changed_when: true
+
+    - name: "Debug USB disable result"
+      ansible.builtin.debug:
+        msg:
+          - "Blacklist file changed : {{ usb_result.changed }}"
+          - "dracut rebuilded       : {{ dracut_result is defined and dracut_result.changed | default(false) }}"
+
+
+# ================================================================
+# GPO HARDENING
+# GPO Name : Lab-G05-Hardening
+# Linked to: DC=danielr,DC=local
+# ================================================================
+
+# ---- GPO-1 | Password Policy - Min Length and Complexity ----
+# Set-ADDefaultDomainPasswordPolicy configures the domain-wide
+# default password policy (same as Default Domain Policy security
+# settings) without requiring GPMC.
+#
+# MinPasswordLength 14  : 14-character minimum; exceeds NIST SP800-63
+#                         and CIS Benchmark recommendations.
+# ComplexityEnabled     : Requires uppercase, lowercase, digit, and symbol.
+# PasswordHistoryCount 10: Prevents reuse of the last 10 passwords.
+- name: "G05 | GPO-1 | Set domain password minimum length and complexity"
+  hosts: AD01
+  gather_facts: false
+
+  tasks:
+
+    - name: "Apply password policy via Set-ADDefaultDomainPasswordPolicy"
+      ansible.windows.win_shell: |
+        Set-ADDefaultDomainPasswordPolicy `
+          -Identity "danielr.local" `
+          -MinPasswordLength 14 `
+          -ComplexityEnabled $true `
+          -PasswordHistoryCount 10
+        Write-Output "SET"
+      register: pwd_policy
+      changed_when: "'SET' in pwd_policy.stdout"
+
+    - name: "Read back current password policy for verification"
+      ansible.windows.win_shell: |
+        Get-ADDefaultDomainPasswordPolicy -Identity "danielr.local" |
+          Select-Object MinPasswordLength, ComplexityEnabled, PasswordHistoryCount |
+          Format-List
+      register: pwd_verify
+      changed_when: false
+
+    - name: "Display current password policy"
+      ansible.builtin.debug:
+        var: pwd_verify.stdout_lines
+
+
+# ---- GPO-2 | Require SMB Signing on the Server Service ----
+# SMB relay attacks (e.g., NTLM relay via ntlmrelayx) work by
+# forwarding captured credentials to an SMB target that does not
+# require signed sessions.
+# RequireSecuritySignature = 1 forces all SMB clients to sign
+# sessions when connecting to this server, blocking relay.
+# EnableSecuritySignature = 1 enables signing; RequireSecuritySignature
+# enforces it as mandatory rather than optional.
+- name: "G05 | GPO-2 | Require SMB signing on Windows server service"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G05-Hardening"
+    domain_dn: "DC=danielr,DC=local"
+    smb_key: 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+
+  tasks:
+
+    - name: "Create and link Lab-G05-Hardening GPO if needed"
+      ansible.windows.win_shell: |
+        if (-not (Get-GPO -Name "{{ gpo_name }}" -EA SilentlyContinue)) {
+            New-GPO  -Name "{{ gpo_name }}" | Out-Null
+            New-GPLink -Name "{{ gpo_name }}" -Target "{{ domain_dn }}" | Out-Null
+            Write-Output "CREATED_AND_LINKED"
+        } else { Write-Output "EXISTS" }
+      register: gpo_g05
+      changed_when: "'CREATED' in gpo_g05.stdout"
+
+    - name: "Enable SMB security signing (EnableSecuritySignature = 1)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ smb_key }}" `
+          -ValueName "EnableSecuritySignature" -Type DWord -Value 1
+        Write-Output "SET"
+      register: smb_enable
+      changed_when: "'SET' in smb_enable.stdout"
+
+    - name: "Require SMB security signing (RequireSecuritySignature = 1)"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ smb_key }}" `
+          -ValueName "RequireSecuritySignature" -Type DWord -Value 1
+        Write-Output "SET"
+      register: smb_require
+      changed_when: "'SET' in smb_require.stdout"
+
+    - name: "Debug SMB signing GPO results"
+      ansible.builtin.debug:
+        msg:
+          - "GPO state                : {{ gpo_g05.stdout    | trim }}"
+          - "EnableSecuritySignature  : {{ smb_enable.stdout | trim }}"
+          - "RequireSecuritySignature : {{ smb_require.stdout | trim }}"
+
+
+# ---- GPO-3 | Restrict Anonymous Access to Named Pipes and Shares ----
+# RestrictNullSessAccess = 1 prevents unauthenticated (null session)
+# connections from accessing named pipes and shares not explicitly
+# listed in NullSessionPipes / NullSessionShares.
+#
+# NullSessionPipes cleared to empty (MultiString with no entries)
+# ensures no pipes are accessible anonymously, closing a legacy
+# Windows networking path frequently used in enumeration tools.
+- name: "G05 | GPO-3 | Restrict anonymous access to named pipes and shares"
+  hosts: AD01
+  gather_facts: false
+
+  vars:
+    gpo_name: "Lab-G05-Hardening"
+    lsrv_key: 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+
+  tasks:
+
+    - name: "Set RestrictNullSessAccess = 1 to block anonymous sessions"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ lsrv_key }}" `
+          -ValueName "RestrictNullSessAccess" -Type DWord -Value 1
+        Write-Output "SET"
+      register: null_access
+      changed_when: "'SET' in null_access.stdout"
+
+    # MultiString type with an empty array (@()) clears the list of
+    # pipes accessible without authentication (NullSessionPipes).
+    - name: "Clear NullSessionPipes to block all anonymous pipe access"
+      ansible.windows.win_shell: |
+        Set-GPRegistryValue -Name "{{ gpo_name }}" `
+          -Key "{{ lsrv_key }}" `
+          -ValueName "NullSessionPipes" -Type MultiString -Value @()
+        Write-Output "SET"
+      register: null_pipes
+      changed_when: "'SET' in null_pipes.stdout"
+
+    - name: "Debug anonymous access restriction results"
+      ansible.builtin.debug:
+        msg:
+          - "RestrictNullSessAccess : {{ null_access.stdout | trim }}"
+          - "NullSessionPipes clear : {{ null_pipes.stdout  | trim }}"
+
+
+- name: "G05 | GPO | Force gpupdate on all domain-joined Windows hosts"
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: "Run gpupdate /force"
+      ansible.windows.win_shell: gpupdate /force
+      changed_when: false
+      register: gpu_out
+
+    - name: "Display gpupdate output"
+      ansible.builtin.debug:
+        var: gpu_out.stdout_lines
+
+
+# ================================================================
+# END OF GROUP 05 - ALL GROUPS COMPLETE
+# ================================================================
+- name: "G05 | END | Final 2-second countdown - all groups complete"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    - name: "Countdown [ 2 ]"
+      ansible.builtin.debug:
+        msg: "Group 05 complete -- [ 2 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "Countdown [ 1 ]"
+      ansible.builtin.debug:
+        msg: "All 5 groups done -- [ 1 ]"
+
+    - name: "Wait 1 second"
+      ansible.builtin.wait_for:
+        timeout: 1
+      changed_when: false
+
+    - name: "All groups complete"
+      ansible.builtin.debug:
+        msg: "Lab complete. Enjoy Spring Break."
